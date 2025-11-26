@@ -7,7 +7,16 @@ from datetime import datetime
 from typing import Optional, List, Dict
 
 app = FastAPI()
+
+# Load model once at startup (not per request)
+print("Loading sentence-transformers model...", flush=True)
 model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+print("Model loaded successfully", flush=True)
+
+# Warm up model with a dummy embedding to prevent first-request slowness
+print("Warming up model...", flush=True)
+_ = model.encode("warmup text", show_progress_bar=False)
+print("Model warmed up and ready", flush=True)
 
 # ✅ Secure configuration
 QDRANT_URL = "https://558d3fea-5962-46da-bffa-94aba210a6c6.eu-west-1-0.aws.cloud.qdrant.io"
@@ -138,6 +147,10 @@ async def embed_video(data: dict):
         segments_embedded = 0
         segments_without_text = 0
         
+        # Collect all texts first for batch embedding
+        texts_to_embed = []
+        segment_metadata = []
+        
         for idx, segment in enumerate(identification_segments):
             # Extract segment data
             speaker = segment.get("speaker", "UNKNOWN")
@@ -155,13 +168,38 @@ async def embed_video(data: dict):
                     print(f"DEBUG: Skipping segment {idx}: speaker={speaker}, start={start_time}, end={end_time}, text='{text[:50] if text else 'EMPTY'}'", flush=True)
                 continue
             
-            # Generate embedding for this segment
-            vector = model.encode(text).tolist()
+            # Store text and metadata for batch processing
+            texts_to_embed.append(text)
+            segment_metadata.append({
+                'idx': idx,
+                'speaker': speaker,
+                'diarization_speaker': diarization_speaker,
+                'match_type': match_type,
+                'start_time': start_time,
+                'end_time': end_time,
+                'confidence': confidence,
+                'text': text
+            })
+        
+        if not texts_to_embed:
+            print(f"DEBUG: No valid segments found. Total segments: {len(identification_segments)}, Segments without text: {segments_without_text}", flush=True)
+            raise HTTPException(status_code=400, detail=f"No valid segments found to embed. Total: {len(identification_segments)}, Without text: {segments_without_text}")
+        
+        # Generate embeddings for ALL texts in one batch (MUCH faster!)
+        print(f"Generating embeddings for {len(texts_to_embed)} segments in batch...", flush=True)
+        batch_start_time = datetime.utcnow()
+        vectors = model.encode(texts_to_embed, show_progress_bar=False, batch_size=32).tolist()
+        batch_end_time = datetime.utcnow()
+        batch_duration = (batch_end_time - batch_start_time).total_seconds()
+        print(f"Batch embedding completed in {batch_duration:.2f} seconds", flush=True)
+        
+        # Create points with pre-computed embeddings
+        for i, metadata in enumerate(segment_metadata):
+            vector = vectors[i]
             
             # Create unique ID for this segment (Qdrant accepts string or UUID)
-            # Using UUID format for compatibility
             import hashlib
-            id_string = f"video_{video_id}_seg_{idx}"
+            id_string = f"video_{video_id}_seg_{metadata['idx']}"
             point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, id_string))
             
             # Prepare metadata payload
@@ -171,16 +209,16 @@ async def embed_video(data: dict):
                 "video_filename": video_filename,
                 "youtube_url": youtube_url,
                 "language": language,
-                "segment_index": idx,
-                "speaker": speaker,
-                "diarization_speaker": diarization_speaker,
-                "match_type": match_type,
-                "start_time": start_time,
-                "end_time": end_time,
-                "duration": end_time - start_time,
-                "text": text,
-                "text_length": len(text),
-                "confidence": confidence,
+                "segment_index": metadata['idx'],
+                "speaker": metadata['speaker'],
+                "diarization_speaker": metadata['diarization_speaker'],
+                "match_type": metadata['match_type'],
+                "start_time": metadata['start_time'],
+                "end_time": metadata['end_time'],
+                "duration": metadata['end_time'] - metadata['start_time'],
+                "text": metadata['text'],
+                "text_length": len(metadata['text']),
+                "confidence": metadata['confidence'],
                 "created_at": datetime.utcnow().isoformat()
             }
             
@@ -200,12 +238,15 @@ async def embed_video(data: dict):
         batch_size = 100
         total_inserted = 0
         
+        print(f"Inserting {len(points)} points into Qdrant in batches of {batch_size}...", flush=True)
+        
         for i in range(0, len(points), batch_size):
             batch = points[i:i + batch_size]
             
             batch_payload = {"points": batch}
             
             try:
+                print(f"Inserting batch {i//batch_size + 1}/{(len(points) + batch_size - 1)//batch_size}...", flush=True)
                 response = requests.put(
                     f"{QDRANT_URL}/collections/{SEGMENTS_COLLECTION}/points",
                     json=batch_payload,
@@ -214,7 +255,7 @@ async def embed_video(data: dict):
                 )
                 response.raise_for_status()
                 total_inserted += len(batch)
-                print(f"Inserted batch {i//batch_size + 1}: {len(batch)} segments (total: {total_inserted})", flush=True)
+                print(f"✓ Batch {i//batch_size + 1} inserted successfully ({total_inserted}/{len(points)} total)", flush=True)
             except requests.exceptions.HTTPError as e:
                 print(f"ERROR: Qdrant rejected batch {i//batch_size + 1}", flush=True)
                 print(f"Status code: {e.response.status_code}", flush=True)
