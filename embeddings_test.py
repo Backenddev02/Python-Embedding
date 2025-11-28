@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from sentence_transformers import SentenceTransformer
-import requests
+from qdrant_client import models, QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, SearchParams
 import uuid
 import os
 from datetime import datetime
@@ -9,12 +10,12 @@ from typing import Optional, List, Dict
 app = FastAPI()
 
 # Load model once at startup (not per request)
-print("Loading sentence-transformers model...", flush=True)
+print("Loading sentence-transformers model.. .", flush=True)
 model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 print("Model loaded successfully", flush=True)
 
 # Warm up model with a dummy embedding to prevent first-request slowness
-print("Warming up model...", flush=True)
+print("Warming up model.. .", flush=True)
 _ = model.encode("warmup text", show_progress_bar=False)
 print("Model warmed up and ready", flush=True)
 
@@ -24,46 +25,58 @@ QDRANT_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwiZXhwI
 
 # Collection names
 SEGMENTS_COLLECTION = "video_transcript_segments"
-LEGACY_COLLECTION = "text_embeddings"  # Keep old collection for backward compatibility
+LEGACY_COLLECTION = "text_embeddings"
 
-def get_qdrant_headers():
-    headers = {"Content-Type": "application/json"}
-    if QDRANT_API_KEY:
-        headers["api-key"] = QDRANT_API_KEY
-    return headers
+# Initialize Qdrant Client (MUCH better than requests!)
+print("Connecting to Qdrant...", flush=True)
+qdrant_client = QdrantClient(
+    url=QDRANT_URL,
+    api_key=QDRANT_API_KEY,
+    timeout=30
+)
+print("✓ Connected to Qdrant successfully", flush=True)
 
 def create_segments_collection():
     """Create the video_transcript_segments collection with proper schema"""
     try:
-        check_url = f"{QDRANT_URL}/collections/{SEGMENTS_COLLECTION}"
-        response = requests.get(check_url, headers=get_qdrant_headers())
+        # Check if collection exists
+        collections = qdrant_client.get_collections(). collections
+        collection_names = [c.name for c in collections]
         
-        if response.status_code == 404:
+        if SEGMENTS_COLLECTION not in collection_names:
             print(f"Creating collection '{SEGMENTS_COLLECTION}'...", flush=True)
-            create_url = f"{QDRANT_URL}/collections/{SEGMENTS_COLLECTION}"
-            data = {
-                "vectors": {
-                    "size": 384,  # all-MiniLM-L6-v2 dimension
-                    "distance": "Cosine"
-                },
-                "optimizers_config": {
-                    "indexing_threshold": 1000
-                },
-                # Define payload schema for better filtering
-                "payload_schema": {
-                    "video_id": {"type": "integer", "index": True},
-                    "speaker": {"type": "keyword", "index": True},
-                    "diarization_speaker": {"type": "keyword", "index": True},
-                    "start_time": {"type": "float", "index": True},
-                    "end_time": {"type": "float", "index": True},
-                    "language": {"type": "keyword", "index": True}
-                }
-            }
-            create_response = requests.put(create_url, json=data, headers=get_qdrant_headers())
-            create_response.raise_for_status()
-            print(f"Collection '{SEGMENTS_COLLECTION}' created successfully", flush=True)
+            
+            qdrant_client.create_collection(
+                collection_name=SEGMENTS_COLLECTION,
+                vectors_config=VectorParams(
+                    size=384,  # all-MiniLM-L6-v2 dimension
+                    distance=Distance. COSINE
+                ),
+                optimizers_config=models.OptimizersConfigDiff(
+                    indexing_threshold=1000
+                )
+            )
+            
+            # Create payload indexes for faster filtering
+            qdrant_client.create_payload_index(
+                collection_name=SEGMENTS_COLLECTION,
+                field_name="video_id",
+                field_schema=models.PayloadSchemaType.INTEGER
+            )
+            qdrant_client.create_payload_index(
+                collection_name=SEGMENTS_COLLECTION,
+                field_name="speaker",
+                field_schema=models.PayloadSchemaType. KEYWORD
+            )
+            qdrant_client.create_payload_index(
+                collection_name=SEGMENTS_COLLECTION,
+                field_name="start_time",
+                field_schema=models. PayloadSchemaType.FLOAT
+            )
+            
+            print(f"✓ Collection '{SEGMENTS_COLLECTION}' created successfully", flush=True)
         else:
-            print(f"Collection '{SEGMENTS_COLLECTION}' already exists", flush=True)
+            print(f"✓ Collection '{SEGMENTS_COLLECTION}' already exists", flush=True)
     except Exception as e:
         print(f"Error managing collection: {str(e)}", flush=True)
         raise
@@ -71,24 +84,24 @@ def create_segments_collection():
 def create_legacy_collection():
     """Create the legacy text_embeddings collection"""
     try:
-        check_url = f"{QDRANT_URL}/collections/{LEGACY_COLLECTION}"
-        response = requests.get(check_url, headers=get_qdrant_headers())
+        collections = qdrant_client.get_collections().collections
+        collection_names = [c.name for c in collections]
         
-        if response.status_code == 404:
+        if LEGACY_COLLECTION not in collection_names:
             print(f"Creating legacy collection '{LEGACY_COLLECTION}'...", flush=True)
-            create_url = f"{QDRANT_URL}/collections/{LEGACY_COLLECTION}"
-            data = {
-                "vectors": {
-                    "size": 384,
-                    "distance": "Cosine"
-                },
-                "optimizers_config": {
-                    "indexing_threshold": 10000
-                }
-            }
-            create_response = requests.put(create_url, json=data, headers=get_qdrant_headers())
-            create_response.raise_for_status()
-            print(f"Collection '{LEGACY_COLLECTION}' created successfully", flush=True)
+            
+            qdrant_client. create_collection(
+                collection_name=LEGACY_COLLECTION,
+                vectors_config=VectorParams(
+                    size=384,
+                    distance=Distance. COSINE
+                ),
+                optimizers_config=models.OptimizersConfigDiff(
+                    indexing_threshold=10000
+                )
+            )
+            
+            print(f"✓ Collection '{LEGACY_COLLECTION}' created successfully", flush=True)
     except Exception as e:
         print(f"Error managing legacy collection: {str(e)}", flush=True)
 
@@ -107,7 +120,7 @@ async def embed_video(data: dict):
         "video_filename": str,
         "youtube_url": str,
         "language": str,
-        "identification_segments": [...],
+        "identification_segments": [... ],
         "speakers_transcript": [...],
         "diarization_segments": [...]
     }
@@ -127,17 +140,6 @@ async def embed_video(data: dict):
         language = data.get("language", "")
         
         print(f"Processing video {video_id} with {len(identification_segments)} segments", flush=True)
-        
-        # Debug: Log first segment structure
-        if identification_segments:
-            first_seg = identification_segments[0]
-            print(f"DEBUG: First segment keys: {list(first_seg.keys())}", flush=True)
-            print(f"DEBUG: First segment has 'text' key: {'text' in first_seg}", flush=True)
-            if 'text' in first_seg:
-                print(f"DEBUG: First segment text length: {len(first_seg.get('text', ''))}", flush=True)
-                print(f"DEBUG: First segment text preview: {first_seg.get('text', '')[:100]}", flush=True)
-            else:
-                print(f"DEBUG: First segment full content: {first_seg}", flush=True)
         
         # First, delete existing embeddings for this video (if any)
         delete_existing_embeddings(video_id)
@@ -164,12 +166,10 @@ async def embed_video(data: dict):
             # Skip empty segments
             if not text or len(text.strip()) < 3:
                 segments_without_text += 1
-                if idx < 3:  # Log first 3 skipped segments
-                    print(f"DEBUG: Skipping segment {idx}: speaker={speaker}, start={start_time}, end={end_time}, text='{text[:50] if text else 'EMPTY'}'", flush=True)
                 continue
             
             # Store text and metadata for batch processing
-            texts_to_embed.append(text)
+            texts_to_embed. append(text)
             segment_metadata.append({
                 'idx': idx,
                 'speaker': speaker,
@@ -182,25 +182,27 @@ async def embed_video(data: dict):
             })
         
         if not texts_to_embed:
-            print(f"DEBUG: No valid segments found. Total segments: {len(identification_segments)}, Segments without text: {segments_without_text}", flush=True)
-            raise HTTPException(status_code=400, detail=f"No valid segments found to embed. Total: {len(identification_segments)}, Without text: {segments_without_text}")
+            raise HTTPException(
+                status_code=400, 
+                detail=f"No valid segments found to embed.  Total: {len(identification_segments)}, Without text: {segments_without_text}"
+            )
         
         # Generate embeddings for ALL texts in one batch (MUCH faster!)
         print(f"Generating embeddings for {len(texts_to_embed)} segments in batch...", flush=True)
         batch_start_time = datetime.utcnow()
-        vectors = model.encode(texts_to_embed, show_progress_bar=False, batch_size=32).tolist()
+        vectors = model.encode(texts_to_embed, show_progress_bar=False, batch_size=32). tolist()
         batch_end_time = datetime.utcnow()
         batch_duration = (batch_end_time - batch_start_time).total_seconds()
-        print(f"Batch embedding completed in {batch_duration:.2f} seconds", flush=True)
+        print(f"✓ Batch embedding completed in {batch_duration:. 2f} seconds", flush=True)
         
         # Create points with pre-computed embeddings
         for i, metadata in enumerate(segment_metadata):
             vector = vectors[i]
             
-            # Create unique ID for this segment (Qdrant accepts string or UUID)
+            # Create unique ID for this segment
             import hashlib
             id_string = f"video_{video_id}_seg_{metadata['idx']}"
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, id_string))
+            point_id = str(uuid.uuid5(uuid. NAMESPACE_DNS, id_string))
             
             # Prepare metadata payload
             payload = {
@@ -222,53 +224,45 @@ async def embed_video(data: dict):
                 "created_at": datetime.utcnow().isoformat()
             }
             
-            points.append({
-                "id": point_id,
-                "vector": vector,
-                "payload": payload
-            })
+            # Use PointStruct for Qdrant client
+            points.append(
+                PointStruct(
+                    id=point_id,
+                    vector=vector,
+                    payload=payload
+                )
+            )
             
             segments_embedded += 1
         
         if not points:
-            print(f"DEBUG: No valid segments found. Total segments: {len(identification_segments)}, Segments without text: {segments_without_text}", flush=True)
-            raise HTTPException(status_code=400, detail=f"No valid segments found to embed. Total: {len(identification_segments)}, Without text: {segments_without_text}")
+            raise HTTPException(
+                status_code=400, 
+                detail=f"No valid segments found to embed. Total: {len(identification_segments)}, Without text: {segments_without_text}"
+            )
         
-        # Batch insert all points (Qdrant handles batches efficiently)
-        batch_size = 100
-        total_inserted = 0
+        # Batch insert all points using Qdrant client (handles batching automatically!)
+        print(f"Inserting {len(points)} points into Qdrant...", flush=True)
         
-        print(f"Inserting {len(points)} points into Qdrant in batches of {batch_size}...", flush=True)
-        
-        for i in range(0, len(points), batch_size):
-            batch = points[i:i + batch_size]
-            
-            batch_payload = {"points": batch}
-            
-            try:
-                print(f"Inserting batch {i//batch_size + 1}/{(len(points) + batch_size - 1)//batch_size}...", flush=True)
-                response = requests.put(
-                    f"{QDRANT_URL}/collections/{SEGMENTS_COLLECTION}/points",
-                    json=batch_payload,
-                    headers=get_qdrant_headers(),
-                    timeout=30
-                )
-                response.raise_for_status()
-                total_inserted += len(batch)
-                print(f"✓ Batch {i//batch_size + 1} inserted successfully ({total_inserted}/{len(points)} total)", flush=True)
-            except requests.exceptions.HTTPError as e:
-                print(f"ERROR: Qdrant rejected batch {i//batch_size + 1}", flush=True)
-                print(f"Status code: {e.response.status_code}", flush=True)
-                print(f"Response: {e.response.text}", flush=True)
-                print(f"Sample point from batch: {batch[0] if batch else 'empty'}", flush=True)
-                raise HTTPException(status_code=500, detail=f"Qdrant error: {e.response.text}")
+        try:
+            # Qdrant client automatically handles batching efficiently
+            qdrant_client. upsert(
+                collection_name=SEGMENTS_COLLECTION,
+                points=points,
+                wait=True  # Wait for indexing to complete
+            )
+            print(f"✓ Successfully inserted {len(points)} points", flush=True)
+        except Exception as e:
+            print(f"ERROR: Qdrant insertion failed: {str(e)}", flush=True)
+            raise HTTPException(status_code=500, detail=f"Qdrant error: {str(e)}")
         
         return {
             "success": True,
             "video_id": video_id,
             "collection": SEGMENTS_COLLECTION,
             "segments_embedded": segments_embedded,
-            "total_points_inserted": total_inserted,
+            "total_points_inserted": len(points),
+            "embedding_time_seconds": round(batch_duration, 2),
             "message": f"Successfully embedded {segments_embedded} segments for video {video_id}"
         }
         
@@ -279,30 +273,24 @@ async def embed_video(data: dict):
 def delete_existing_embeddings(video_id: int):
     """Delete all existing embeddings for a video"""
     try:
-        delete_payload = {
-            "filter": {
-                "must": [
-                    {"key": "video_id", "match": {"value": video_id}}
-                ]
-            }
-        }
-        
-        response = requests.post(
-            f"{QDRANT_URL}/collections/{SEGMENTS_COLLECTION}/points/delete",
-            json=delete_payload,
-            headers=get_qdrant_headers(),
-            timeout=10
+        qdrant_client.delete(
+            collection_name=SEGMENTS_COLLECTION,
+            points_selector=models.FilterSelector(
+                filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="video_id",
+                            match=MatchValue(value=video_id)
+                        )
+                    ]
+                )
+            )
         )
-        
-        if response.ok:
-            print(f"Deleted existing embeddings for video {video_id}", flush=True)
-        else:
-            print(f"No existing embeddings to delete for video {video_id}", flush=True)
-            
+        print(f"✓ Deleted existing embeddings for video {video_id}", flush=True)
     except Exception as e:
-        print(f"Error deleting embeddings: {str(e)}", flush=True)
+        print(f"Note: Could not delete embeddings (may not exist): {str(e)}", flush=True)
 
-@app.post("/embed")
+@app. post("/embed")
 async def embed(data: dict):
     """Legacy endpoint - kept for backward compatibility"""
     text = data.get("text", "")
@@ -312,7 +300,7 @@ async def embed(data: dict):
         raise HTTPException(status_code=400, detail="Text is required")
     
     # Generate embedding
-    vector = model.encode(text).tolist()
+    vector = model.encode(text). tolist()
     vector_id = f"video_{video_id}_{uuid.uuid4()}" if video_id else str(uuid.uuid4())
 
     metadata = {
@@ -325,23 +313,18 @@ async def embed(data: dict):
     if video_id:
         metadata["video_id"] = video_id
 
-    payload = {
-        "points": [{
-            "id": vector_id,
-            "vector": vector,
-            "payload": metadata
-        }]
-    }
-    
     try:
-        response = requests.put(
-            f"{QDRANT_URL}/collections/{LEGACY_COLLECTION}/points",
-            json=payload,
-            headers=get_qdrant_headers(),
-            timeout=10
+        qdrant_client.upsert(
+            collection_name=LEGACY_COLLECTION,
+            points=[
+                PointStruct(
+                    id=vector_id,
+                    vector=vector,
+                    payload=metadata
+                )
+            ]
         )
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         raise HTTPException(status_code=500, detail=f"Qdrant error: {str(e)}")
       
     return {
@@ -354,109 +337,256 @@ async def embed(data: dict):
 
 @app.post("/search")
 async def search(data: dict):
-    """Search for similar segments across all videos or within a specific video"""
+    """
+    🔍 SEMANTIC SEARCH - Find similar segments using AI-powered similarity
+    
+    Searches for segments semantically similar to the query text.
+    
+    Parameters:
+    - query: Text to search for (required)
+    - top_k: Number of results to return (default: 10)
+    - video_id: Filter by specific video (optional)
+    - speaker: Filter by speaker name (optional)
+    - min_score: Minimum similarity score 0-1 (default: 0.5)
+    - language: Filter by language (optional)
+    - time_range: Filter by time range {"start": float, "end": float} (optional)
+    """
     query_text = data.get("query", "")
     top_k = data.get("top_k", 10)
     video_id_filter = data.get("video_id")
     speaker_filter = data.get("speaker")
-    min_score = data.get("min_score", 0.5)  # Minimum similarity score
+    language_filter = data.get("language")
+    min_score = data.get("min_score", 0.5)
+    time_range = data.get("time_range")  # {"start": 0, "end": 100}
     
     if not query_text:
         raise HTTPException(status_code=400, detail="Query text is required")
     
+    print(f"🔍 Semantic search for: '{query_text[:100]}'", flush=True)
+    
+    # Generate query embedding
     query_vector = model.encode(query_text).tolist()
     
-    search_payload = {
-        "vector": query_vector,
-        "limit": top_k,
-        "with_payload": True,
-        "with_vector": False,
-        "score_threshold": min_score  # Only return results above this threshold
-    }
-    
     # Build filters
-    filters = []
-    if video_id_filter:
-        filters.append({"key": "video_id", "match": {"value": video_id_filter}})
-    if speaker_filter:
-        filters.append({"key": "speaker", "match": {"value": speaker_filter}})
+    filter_conditions = []
     
-    if filters:
-        search_payload["filter"] = {"must": filters}
+    if video_id_filter:
+        filter_conditions.append(
+            FieldCondition(
+                key="video_id",
+                match=MatchValue(value=video_id_filter)
+            )
+        )
+    
+    if speaker_filter:
+        filter_conditions.append(
+            FieldCondition(
+                key="speaker",
+                match=MatchValue(value=speaker_filter)
+            )
+        )
+    
+    if language_filter:
+        filter_conditions.append(
+            FieldCondition(
+                key="language",
+                match=MatchValue(value=language_filter)
+            )
+        )
+    
+    # Time range filter
+    if time_range:
+        start_time = time_range.get("start")
+        end_time = time_range.get("end")
+        
+        if start_time is not None:
+            filter_conditions.append(
+                FieldCondition(
+                    key="start_time",
+                    range=models.Range(gte=start_time)
+                )
+            )
+        
+        if end_time is not None:
+            filter_conditions.append(
+                FieldCondition(
+                    key="end_time",
+                    range=models. Range(lte=end_time)
+                )
+            )
+    
+    # Build filter object
+    search_filter = None
+    if filter_conditions:
+        search_filter = Filter(must=filter_conditions)
     
     try:
-        response = requests.post(
-            f"{QDRANT_URL}/collections/{SEGMENTS_COLLECTION}/points/search",
-            json=search_payload,
-            headers=get_qdrant_headers(),
-            timeout=15
+        # Perform semantic search using Qdrant client
+        search_results = qdrant_client.search(
+            collection_name=SEGMENTS_COLLECTION,
+            query_vector=query_vector,
+            limit=top_k,
+            score_threshold=min_score,  # Only return results above this threshold
+            query_filter=search_filter,
+            with_payload=True,
+            with_vectors=False  # Don't return vectors (saves bandwidth)
         )
-        response.raise_for_status()
-        results = response.json()
+        
+        print(f"✓ Found {len(search_results)} results", flush=True)
         
         return {
             "query": query_text,
             "collection": SEGMENTS_COLLECTION,
+            "total_results": len(search_results),
             "filters_applied": {
                 "video_id": video_id_filter,
                 "speaker": speaker_filter,
+                "language": language_filter,
+                "time_range": time_range,
                 "min_score": min_score
             },
             "results": [
                 {
-                    "id": r["id"],
-                    "score": round(r["score"], 4),
-                    "video_id": r["payload"].get("video_id"),
-                    "video_title": r["payload"].get("video_title", ""),
-                    "speaker": r["payload"].get("speaker", ""),
-                    "diarization_speaker": r["payload"].get("diarization_speaker", ""),
-                    "start_time": r["payload"].get("start_time", 0),
-                    "end_time": r["payload"].get("end_time", 0),
-                    "text": r["payload"].get("text", ""),
-                    "youtube_url": r["payload"].get("youtube_url", ""),
-                    "created_at": r["payload"].get("created_at")
+                    "id": r.id,
+                    "score": round(r.score, 4),
+                    "similarity_percentage": round(r.score * 100, 2),
+                    "video_id": r.payload.get("video_id"),
+                    "video_title": r.payload.get("video_title", ""),
+                    "speaker": r.payload.get("speaker", ""),
+                    "diarization_speaker": r.payload.get("diarization_speaker", ""),
+                    "start_time": r.payload.get("start_time", 0),
+                    "end_time": r.payload.get("end_time", 0),
+                    "duration": round(r.payload.get("end_time", 0) - r.payload.get("start_time", 0), 2),
+                    "text": r.payload.get("text", ""),
+                    "text_length": r.payload.get("text_length", 0),
+                    "youtube_url": r.payload.get("youtube_url", ""),
+                    "language": r.payload.get("language", ""),
+                    "created_at": r.payload.get("created_at"),
+                    # Create timestamped YouTube URL
+                    "youtube_url_timestamped": f"{r.payload.get('youtube_url', '')}?t={int(r.payload.get('start_time', 0))}" if r.payload.get('youtube_url') else ""
                 }
-                for r in results.get("result", [])
+                for r in search_results
             ]
         }
+    except Exception as e:
+        print(f"ERROR in search: {str(e)}", flush=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/search-multi-video")
+async def search_multi_video(data: dict):
+    """
+    🔍 Search across multiple specific videos
+    
+    Parameters:
+    - query: Text to search for (required)
+    - video_ids: List of video IDs to search in (required)
+    - top_k: Number of results per video (default: 5)
+    - min_score: Minimum similarity score (default: 0.5)
+    """
+    query_text = data. get("query", "")
+    video_ids = data.get("video_ids", [])
+    top_k = data.get("top_k", 5)
+    min_score = data.get("min_score", 0. 5)
+    
+    if not query_text:
+        raise HTTPException(status_code=400, detail="Query text is required")
+    
+    if not video_ids:
+        raise HTTPException(status_code=400, detail="video_ids list is required")
+    
+    print(f"🔍 Searching across {len(video_ids)} videos for: '{query_text[:100]}'", flush=True)
+    
+    query_vector = model.encode(query_text).tolist()
+    
+    try:
+        # Search with video_id filter using "should" (OR condition)
+        search_filter = Filter(
+            should=[
+                FieldCondition(
+                    key="video_id",
+                    match=MatchValue(value=vid)
+                )
+                for vid in video_ids
+            ]
+        )
+        
+        search_results = qdrant_client.search(
+            collection_name=SEGMENTS_COLLECTION,
+            query_vector=query_vector,
+            limit=top_k * len(video_ids),  # Get more results to cover all videos
+            score_threshold=min_score,
+            query_filter=search_filter,
+            with_payload=True,
+            with_vectors=False
+        )
+        
+        # Group results by video_id
+        results_by_video = {}
+        for r in search_results:
+            vid = r.payload.get("video_id")
+            if vid not in results_by_video:
+                results_by_video[vid] = []
+            
+            if len(results_by_video[vid]) < top_k:  # Limit per video
+                results_by_video[vid].append({
+                    "id": r. id,
+                    "score": round(r.score, 4),
+                    "similarity_percentage": round(r.score * 100, 2),
+                    "speaker": r.payload.get("speaker", ""),
+                    "start_time": r.payload.get("start_time", 0),
+                    "end_time": r.payload.get("end_time", 0),
+                    "text": r.payload.get("text", ""),
+                    "youtube_url_timestamped": f"{r. payload.get('youtube_url', '')}?t={int(r.payload.get('start_time', 0))}" if r. payload.get('youtube_url') else ""
+                })
+        
+        return {
+            "query": query_text,
+            "total_videos_searched": len(video_ids),
+            "videos_with_results": len(results_by_video),
+            "results_by_video": results_by_video
+        }
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/video/{video_id}/segments")
-async def get_video_segments(video_id: int, limit: int = 100):
-    """Get all embedded segments for a specific video"""
+async def get_video_segments(video_id: int, limit: int = 100, offset: int = 0):
+    """Get all embedded segments for a specific video with pagination"""
     try:
-        scroll_payload = {
-            "filter": {
-                "must": [
-                    {"key": "video_id", "match": {"value": video_id}}
+        # Use scroll for efficient retrieval
+        scroll_result = qdrant_client.scroll(
+            collection_name=SEGMENTS_COLLECTION,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="video_id",
+                        match=MatchValue(value=video_id)
+                    )
                 ]
-            },
-            "limit": limit,
-            "with_payload": True,
-            "with_vector": False
-        }
-        
-        response = requests.post(
-            f"{QDRANT_URL}/collections/{SEGMENTS_COLLECTION}/points/scroll",
-            json=scroll_payload,
-            headers=get_qdrant_headers(),
-            timeout=10
+            ),
+            limit=limit,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False
         )
-        response.raise_for_status()
-        results = response.json()
         
-        points = results.get("result", {}).get("points", [])
+        points, next_offset = scroll_result
         
         return {
             "video_id": video_id,
             "total_segments": len(points),
+            "offset": offset,
+            "limit": limit,
+            "next_offset": next_offset,
             "segments": [
                 {
-                    "speaker": p["payload"].get("speaker"),
-                    "start_time": p["payload"].get("start_time"),
-                    "end_time": p["payload"].get("end_time"),
-                    "text": p["payload"].get("text"),
+                    "segment_index": p.payload.get("segment_index"),
+                    "speaker": p.payload.get("speaker"),
+                    "start_time": p.payload.get("start_time"),
+                    "end_time": p.payload.get("end_time"),
+                    "duration": p.payload.get("duration"),
+                    "text": p.payload.get("text"),
+                    "text_length": p.payload.get("text_length"),
                 }
                 for p in points
             ]
@@ -480,43 +610,70 @@ async def delete_video_embeddings(video_id: int):
 async def health():
     """Health check endpoint"""
     try:
-        response = requests.get(
-            f"{QDRANT_URL}/collections/{SEGMENTS_COLLECTION}",
-            headers=get_qdrant_headers(),
-            timeout=5
-        )
+        collection_info = qdrant_client.get_collection(collection_name=SEGMENTS_COLLECTION)
+        
         return {
             "status": "healthy",
-            "qdrant_connected": response.ok,
+            "qdrant_connected": True,
             "collections": {
                 "segments": SEGMENTS_COLLECTION,
                 "legacy": LEGACY_COLLECTION
-            }
+            },
+            "points_count": collection_info.points_count,
+            "vectors_count": collection_info.vectors_count
         }
     except Exception as e:
-        return {"status": "unhealthy", "error": str(e)}
+        return {
+            "status": "unhealthy", 
+            "qdrant_connected": False,
+            "error": str(e)
+        }
 
 @app.get("/stats")
 async def stats():
     """Get collection statistics"""
     try:
-        response = requests.get(
-            f"{QDRANT_URL}/collections/{SEGMENTS_COLLECTION}",
-            headers=get_qdrant_headers(),
-            timeout=5
-        )
-        response.raise_for_status()
-        collection_info = response.json()
+        collection_info = qdrant_client.get_collection(collection_name=SEGMENTS_COLLECTION)
         
         return {
             "collection": SEGMENTS_COLLECTION,
-            "points_count": collection_info.get("result", {}).get("points_count", 0),
-            "vectors_count": collection_info.get("result", {}).get("vectors_count", 0),
-            "indexed_vectors_count": collection_info.get("result", {}).get("indexed_vectors_count", 0),
-            "status": collection_info.get("result", {}).get("status", "unknown")
+            "points_count": collection_info.points_count,
+            "vectors_count": collection_info. vectors_count,
+            "indexed_vectors_count": collection_info.indexed_vectors_count,
+            "status": collection_info. status,
+            "optimizer_status": collection_info.optimizer_status,
+            "config": {
+                "vector_size": collection_info.config.params.vectors.size,
+                "distance": collection_info.config.params. vectors.distance. name
+            }
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/")
+async def root():
+    """API documentation"""
+    return {
+        "service": "Video Transcript Semantic Search API",
+        "version": "2.0",
+        "endpoints": {
+            "POST /embed-video": "Embed entire video transcript",
+            "POST /search": "Semantic search across all videos or filtered by video_id/speaker",
+            "POST /search-multi-video": "Search across multiple specific videos",
+            "GET /video/{video_id}/segments": "Get all segments for a video",
+            "DELETE /video/{video_id}/embeddings": "Delete all embeddings for a video",
+            "GET /health": "Health check",
+            "GET /stats": "Collection statistics"
+        },
+        "features": [
+            "✅ Semantic search using sentence transformers",
+            "✅ Batch embedding for performance",
+            "✅ Qdrant client for efficient operations",
+            "✅ Advanced filtering (video, speaker, time range, language)",
+            "✅ Score thresholding",
+            "✅ Timestamped YouTube URLs"
+        ]
+    }
 
 if __name__ == "__main__":
     import uvicorn
