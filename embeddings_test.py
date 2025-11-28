@@ -17,13 +17,13 @@ print("Warming up model...", flush=True)
 _ = model.encode("warmup text", show_progress_bar=False)
 print("Model warmed up and ready", flush=True)
 
-QDRANT_URL = "https://558d3fea-5962-46da-bffa-94aba210a6c6.eu-west-1-0.aws.cloud. qdrant.io"
+QDRANT_URL = "https://558d3fea-5962-46da-bffa-94aba210a6c6.eu-west-1-0.aws.cloud.qdrant.io"
 QDRANT_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwiZXhwIjoxNzY2NjcwMTM1fQ.c2bNP_BNXhVhM3fApCyKHw7SGV1ITyDMDtT5s1WlGW8"
 
 SEGMENTS_COLLECTION = "video_transcript_segments"
 LEGACY_COLLECTION = "text_embeddings"
 
-print("Connecting to Qdrant...", flush=True)
+print("Connecting to Qdrant.. .", flush=True)
 qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=30)
 print("Connected to Qdrant successfully", flush=True)
 
