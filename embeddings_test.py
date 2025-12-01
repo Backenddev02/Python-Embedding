@@ -228,97 +228,223 @@ async def embed(data: dict):
         "status": "success"
     }
 
-@app. post("/search")
+@app.post("/search")
 async def search(data: dict):
+    """
+    Combined semantic + optional keyword search.
+
+    Accepts:
+      - query (str): semantic query (required unless `word` provided)
+      - word (str): exact/substring word to search for in payload.text (optional)
+      - top_k (int): number of results to return (default 10)
+      - video_id, speaker, language: filters (optional)
+      - min_score (float): semantic score threshold (default 0.5)
+      - time_range (dict): {"start": float, "end": float} (optional)
+      - max_scanned (int): limit for number of items scanned for keyword search (default 10000)
+    """
     query_text = data.get("query", "")
-    top_k = data.get("top_k", 10)
+    word = data.get("word")  # optional substring/word search
+    top_k = int(data.get("top_k", 10))
     video_id_filter = data.get("video_id")
     speaker_filter = data.get("speaker")
     language_filter = data.get("language")
-    min_score = data.get("min_score", 0.5)
+    min_score = float(data.get("min_score", 0.5))
     time_range = data.get("time_range")
-    
-    if not query_text:
-        raise HTTPException(status_code=400, detail="Query text is required")
-    
-    print(f"Semantic search for: '{query_text[:100]}'", flush=True)
-    
-    query_vector = model.encode(query_text).tolist()
+    max_scanned = int(data.get("max_scanned", 10000))  # avoids unbounded scans
+
+    if not query_text and not word:
+        raise HTTPException(status_code=400, detail="Either 'query' or 'word' is required")
+
+    # Build Qdrant payload filter conditions
     filter_conditions = []
-    
-    if video_id_filter:
+    if video_id_filter is not None:
         filter_conditions.append(FieldCondition(key="video_id", match=MatchValue(value=video_id_filter)))
-    
-    if speaker_filter:
+    if speaker_filter is not None:
         filter_conditions.append(FieldCondition(key="speaker", match=MatchValue(value=speaker_filter)))
-    
-    if language_filter:
+    if language_filter is not None:
         filter_conditions.append(FieldCondition(key="language", match=MatchValue(value=language_filter)))
-    
     if time_range:
-        start_time = time_range. get("start")
+        start_time = time_range.get("start")
         end_time = time_range.get("end")
-        
         if start_time is not None:
             filter_conditions.append(FieldCondition(key="start_time", range=models.Range(gte=start_time)))
-        
         if end_time is not None:
-            filter_conditions.append(FieldCondition(key="end_time", range=models. Range(lte=end_time)))
-    
-    search_filter = None
-    if filter_conditions:
-        search_filter = Filter(must=filter_conditions)
-    
-    try:
-        search_results = qdrant_client.search(
-            collection_name=SEGMENTS_COLLECTION,
-            query_vector=query_vector,
-            limit=top_k,
-            score_threshold=min_score,
-            query_filter=search_filter,
-            with_payload=True,
-            with_vectors=False
-        )
-        
-        print(f"Found {len(search_results)} results", flush=True)
-        
-        return {
-            "query": query_text,
-            "collection": SEGMENTS_COLLECTION,
-            "total_results": len(search_results),
-            "filters_applied": {
-                "video_id": video_id_filter,
-                "speaker": speaker_filter,
-                "language": language_filter,
-                "time_range": time_range,
-                "min_score": min_score
-            },
-            "results": [
-                {
+            filter_conditions.append(FieldCondition(key="end_time", range=models.Range(lte=end_time)))
+
+    search_filter = Filter(must=filter_conditions) if filter_conditions else None
+
+    semantic_results = []
+    keyword_results = []
+
+    # Run semantic search if query_text present
+    if query_text:
+        try:
+            print(f"Semantic search for: '{query_text[:120]}'", flush=True)
+            query_vector = model.encode(query_text).tolist()
+
+            sem_search_results = qdrant_client.search(
+                collection_name=SEGMENTS_COLLECTION,
+                query_vector=query_vector,
+                limit=top_k * 3,  # fetch a few more to allow later dedupe/boost
+                score_threshold=min_score,
+                query_filter=search_filter,
+                with_payload=True,
+                with_vectors=False
+            )
+
+            for r in sem_search_results:
+                semantic_results.append({
                     "id": r.id,
-                    "score": round(r.score, 4),
-                    "similarity_percentage": round(r.score * 100, 2),
+                    "score": float(getattr(r, "score", 0.0)),
                     "video_id": r.payload.get("video_id"),
                     "video_title": r.payload.get("video_title", ""),
                     "speaker": r.payload.get("speaker", ""),
                     "diarization_speaker": r.payload.get("diarization_speaker", ""),
                     "start_time": r.payload.get("start_time", 0),
                     "end_time": r.payload.get("end_time", 0),
-                    "duration": round(r.payload.get("end_time", 0) - r.payload.get("start_time", 0), 2),
+                    "duration": round((r.payload.get("end_time", 0) - r.payload.get("start_time", 0)), 2),
                     "text": r.payload.get("text", ""),
                     "text_length": r.payload.get("text_length", 0),
                     "youtube_url": r.payload.get("youtube_url", ""),
                     "language": r.payload.get("language", ""),
                     "created_at": r.payload.get("created_at"),
-                    "youtube_url_timestamped": f"{r.payload.get('youtube_url', '')}?t={int(r.payload.get('start_time', 0))}" if r.payload.get('youtube_url') else ""
-                }
-                for r in search_results
-            ]
-        }
-    except Exception as e:
-        print(f"ERROR in search: {str(e)}", flush=True)
-        raise HTTPException(status_code=500, detail=str(e))
+                    "match_types": ["semantic"]
+                })
 
+        except Exception as e:
+            print(f"ERROR during semantic search: {str(e)}", flush=True)
+            raise HTTPException(status_code=500, detail=f"Semantic search error: {str(e)}")
+
+    # Run keyword/word (substring) search if requested
+    if word:
+        try:
+            print(f"Keyword search for word: '{word}' (max_scanned={max_scanned})", flush=True)
+            word_lower = word.lower()
+            page_size = 1000
+            scanned = 0
+            offset = 0
+
+            # If we have a filter that narrows to video_id only, use it to speed up scroll.
+            scroll_filter = None
+            if video_id_filter is not None:
+                scroll_filter = Filter(must=[FieldCondition(key="video_id", match=MatchValue(value=video_id_filter))])
+            elif filter_conditions:
+                # if there are other filters, reuse combined filter to limit scan
+                scroll_filter = search_filter
+
+            while scanned < max_scanned:
+                # fetch a page of points
+                points, next_offset = qdrant_client.scroll(
+                    collection_name=SEGMENTS_COLLECTION,
+                    scroll_filter=scroll_filter,
+                    limit=min(page_size, max_scanned - scanned),
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False
+                )
+
+                if not points:
+                    break
+
+                for p in points:
+                    scanned += 1
+                    text = (p.payload.get("text") or "")
+                    if word_lower in text.lower():
+                        keyword_results.append({
+                            "id": p.id,
+                            "score": 1.0,  # keyword exactness gets top score
+                            "video_id": p.payload.get("video_id"),
+                            "video_title": p.payload.get("video_title", ""),
+                            "speaker": p.payload.get("speaker", ""),
+                            "diarization_speaker": p.payload.get("diarization_speaker", ""),
+                            "start_time": p.payload.get("start_time", 0),
+                            "end_time": p.payload.get("end_time", 0),
+                            "duration": round((p.payload.get("end_time", 0) - p.payload.get("start_time", 0)), 2),
+                            "text": text,
+                            "text_length": p.payload.get("text_length", 0),
+                            "youtube_url": p.payload.get("youtube_url", ""),
+                            "language": p.payload.get("language", ""),
+                            "created_at": p.payload.get("created_at"),
+                            "match_types": ["keyword"]
+                        })
+                        # stop early if we have enough keyword matches
+                        if len(keyword_results) >= top_k:
+                            break
+
+                if len(keyword_results) >= top_k:
+                    break
+
+                # If API returned next_offset, use it; otherwise increment offset
+                if not next_offset:
+                    # If no next_offset provided, we increment offset by page_size
+                    offset += page_size
+                else:
+                    offset = next_offset
+
+                # Stop if we've scanned up to max_scanned
+                if scanned >= max_scanned:
+                    break
+
+        except Exception as e:
+            print(f"ERROR during keyword search: {str(e)}", flush=True)
+            raise HTTPException(status_code=500, detail=f"Keyword search error: {str(e)}")
+
+    # Merge semantic and keyword results (deduplicate by id). Keyword matches get priority.
+    merged = {}
+    for r in semantic_results:
+        merged[r["id"]] = r
+
+    for r in keyword_results:
+        if r["id"] in merged:
+            # if already present as semantic, add keyword to match_types and boost score
+            if "keyword" not in merged[r["id"]]["match_types"]:
+                merged[r["id"]]["match_types"].append("keyword")
+            # boost score so exact keyword matches rank higher
+            merged[r["id"]]["score"] = max(merged[r["id"]]["score"], r["score"])
+        else:
+            merged[r["id"]] = r
+
+    # Convert to list and sort by score descending, then limit to top_k
+    merged_list = sorted(merged.values(), key=lambda x: x.get("score", 0), reverse=True)[:top_k]
+
+    # Build response
+    return {
+        "query": query_text,
+        "word": word,
+        "collection": SEGMENTS_COLLECTION,
+        "total_semantic_hits": len(semantic_results),
+        "total_keyword_hits": len(keyword_results),
+        "returned": len(merged_list),
+        "filters_applied": {
+            "video_id": video_id_filter,
+            "speaker": speaker_filter,
+            "language": language_filter,
+            "time_range": time_range,
+            "min_score": min_score,
+            "max_scanned_for_keyword": max_scanned
+        },
+        "results": [
+            {
+                "id": r["id"],
+                "score": round(r["score"], 4),
+                "match_types": r.get("match_types", []),
+                "video_id": r.get("video_id"),
+                "video_title": r.get("video_title", ""),
+                "speaker": r.get("speaker", ""),
+                "diarization_speaker": r.get("diarization_speaker", ""),
+                "start_time": r.get("start_time", 0),
+                "end_time": r.get("end_time", 0),
+                "duration": r.get("duration", 0),
+                "text": r.get("text", ""),
+                "text_length": r.get("text_length", 0),
+                "youtube_url": r.get("youtube_url", ""),
+                "language": r.get("language", ""),
+                "created_at": r.get("created_at"),
+                "youtube_url_timestamped": f"{r.get('youtube_url', '')}?t={int(r.get('start_time', 0))}" if r.get('youtube_url') else ""
+            }
+            for r in merged_list
+        ]
+    }
 @app.post("/search-multi-video")
 async def search_multi_video(data: dict):
     query_text = data.get("query", "")
